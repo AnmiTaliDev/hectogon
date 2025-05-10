@@ -1,0 +1,460 @@
+#!/bin/bash
+#
+# Hectogon - System alternative manager for OpenBase GNU/Linux
+# Part of BaseUtils
+# Developer: AnmiTaliDev
+#
+# Copyright (C) 2025 AnmiTaliDev
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+VERSION="0.1.0"
+MODULEDIR="/usr/share/hectogon/modules"
+CONFIGDIR="/etc/hectogon"
+CONFIG="$CONFIGDIR/config.yaml"
+
+check_root() {
+    if [ "$EUID" -ne 0 ] && [ "$1" = "required" ]; then
+        print_error "This operation requires root privileges"
+        exit 1
+    fi
+}
+
+if [ -t 1 ]; then
+    BOLD="\033[1m"
+    RED="\033[31m"
+    GREEN="\033[32m"
+    YELLOW="\033[33m"
+    BLUE="\033[34m"
+    MAGENTA="\033[35m"
+    CYAN="\033[36m"
+    WHITE="\033[37m"
+    RESET="\033[0m"
+else
+    BOLD=""
+    RED=""
+    GREEN=""
+    YELLOW=""
+    BLUE=""
+    MAGENTA=""
+    CYAN=""
+    WHITE=""
+    RESET=""
+fi
+
+parse_yaml() {
+    local yaml_file=$1
+    [ ! -f "$yaml_file" ] && return 1
+    
+    local s w fs
+    s='[[:space:]]*'
+    w='[a-zA-Z0-9_.-]*'
+    fs=$(echo @|tr @ '\034')
+    
+    sed -ne "s|^\($s\):|\1|" \
+        -e "s|^\($s\)\($w\)$s:$s[\"']\(.*\)[\"']$s\$|\1$fs\2$fs\3|p" \
+        -e "s|^\($s\)\($w\)$s:$s\(.*\)$s\$|\1$fs\2$fs\3|p" "$yaml_file" |
+    awk -F$fs '{
+        indent = length($1)/2;
+        vname[indent] = $2;
+        for (i in vname) {if (i > indent) {delete vname[i]}}
+        if (length($3) > 0) {
+            vn=""; for (i=0; i<indent; i++) {vn=(vn)(vname[i])(".")}
+            printf("%s%s=%s\n", vn, $2, $3);
+        }
+    }'
+}
+
+load_config() {
+    USE_COLOR=true
+    VERBOSE=false
+    LOG_LEVEL="info"
+    CUSTOM_MODULE_PATHS=()
+    
+    if [ -f "$CONFIG" ]; then
+        local config_data
+        config_data=$(parse_yaml "$CONFIG")
+        
+        if echo "$config_data" | grep -q "^general.color="; then
+            local color_setting
+            color_setting=$(echo "$config_data" | grep "^general.color=" | cut -d= -f2)
+            if [ "$color_setting" = "false" ]; then
+                USE_COLOR=false
+                BOLD=""
+                RED=""
+                GREEN=""
+                YELLOW=""
+                BLUE=""
+                MAGENTA=""
+                CYAN=""
+                WHITE=""
+                RESET=""
+            fi
+        fi
+        
+        if echo "$config_data" | grep -q "^general.log_level="; then
+            LOG_LEVEL=$(echo "$config_data" | grep "^general.log_level=" | cut -d= -f2)
+        fi
+        
+        if echo "$config_data" | grep -q "^general.verbose="; then
+            local verbose_setting
+            verbose_setting=$(echo "$config_data" | grep "^general.verbose=" | cut -d= -f2)
+            if [ "$verbose_setting" = "true" ]; then
+                VERBOSE=true
+            fi
+        fi
+        
+        if echo "$config_data" | grep -q "^modules.paths"; then
+            while read -r line; do
+                if [[ "$line" =~ modules\.paths\.[0-9]+=(.*) ]]; then
+                    CUSTOM_MODULE_PATHS+=("${BASH_REMATCH[1]}")
+                fi
+            done <<< "$config_data"
+        fi
+    else
+        print_warning "Configuration file not found: $CONFIG"
+        print_info "Using default settings"
+    fi
+}
+
+print_info() {
+    echo -e "${BLUE}*${RESET} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}✓${RESET} $1"
+}
+
+print_error() {
+    echo -e "${RED}✗${RESET} $1" >&2
+}
+
+print_warning() {
+    echo -e "${YELLOW}!${RESET} $1" >&2
+}
+
+print_header() {
+    echo -e "${BOLD}${CYAN}$1${RESET}"
+    echo -e "${CYAN}$(printf '%*s' ${#1} | tr ' ' '=')${RESET}"
+}
+
+print_debug() {
+    if [ "$VERBOSE" = true ] || [ "$LOG_LEVEL" = "debug" ]; then
+        echo -e "${MAGENTA}D${RESET} $1" >&2
+    fi
+}
+
+find_module() {
+    local module=$1
+    
+    if [ -f "$MODULEDIR/$module.sh" ]; then
+        echo "$MODULEDIR/$module.sh"
+        return 0
+    fi
+    
+    for path in "${CUSTOM_MODULE_PATHS[@]}"; do
+        if [ -f "$path/$module.sh" ]; then
+            echo "$path/$module.sh"
+            return 0
+        fi
+    done
+    
+    return 1
+}
+
+check_module() {
+    local module=$1
+    local module_path
+    
+    module_path=$(find_module "$module")
+    if [ $? -ne 0 ]; then
+        print_error "Module '$module' not found"
+        return 1
+    fi
+    
+    return 0
+}
+
+load_module() {
+    local module=$1
+    local module_path
+    
+    module_path=$(find_module "$module")
+    if [ $? -ne 0 ]; then
+        print_error "Module '$module' not found"
+        return 1
+    fi
+    
+    unset MODULE_NAME MODULE_DESCRIPTION MODULE_AUTHOR MODULE_VERSION
+    unset module_list module_show module_set module_add module_remove module_help
+    
+    source "$module_path"
+    
+    if [ -z "$MODULE_NAME" ] || [ -z "$MODULE_DESCRIPTION" ]; then
+        print_error "Invalid module format: $module_path"
+        print_error "Missing required module metadata"
+        return 1
+    fi
+    
+    if ! type -t module_list >/dev/null || \
+       ! type -t module_show >/dev/null || \
+       ! type -t module_set >/dev/null || \
+       ! type -t module_help >/dev/null; then
+        print_error "Invalid module format: $module_path"
+        print_error "Missing required module functions"
+        return 1
+    fi
+    
+    return 0
+}
+
+list_modules() {
+    print_header "Available modules:"
+    
+    local found=false
+    local module_files=()
+    
+    if [ -d "$MODULEDIR" ]; then
+        for module_file in "$MODULEDIR"/*.sh; do
+            if [ -f "$module_file" ]; then
+                module_files+=("$module_file")
+            fi
+        done
+    fi
+    
+    for path in "${CUSTOM_MODULE_PATHS[@]}"; do
+        if [ -d "$path" ]; then
+            for module_file in "$path"/*.sh; do
+                if [ -f "$module_file" ]; then
+                    module_files+=("$module_file")
+                fi
+            done
+        fi
+    done
+    
+    if [ ${#module_files[@]} -eq 0 ]; then
+        print_warning "No modules found"
+        echo ""
+        echo "Searched in:"
+        echo "  - $MODULEDIR"
+        for path in "${CUSTOM_MODULE_PATHS[@]}"; do
+            echo "  - $path"
+        done
+        echo ""
+        echo "You can create modules in any of these locations."
+        return 0
+    fi
+    
+    IFS=$'\n' sorted_modules=($(sort <<<"${module_files[*]}"))
+    unset IFS
+    
+    for module_file in "${sorted_modules[@]}"; do
+        unset MODULE_NAME MODULE_DESCRIPTION MODULE_AUTHOR MODULE_VERSION
+        
+        source "$module_file"
+        if [ -n "$MODULE_NAME" ] && [ -n "$MODULE_DESCRIPTION" ]; then
+            found=true
+            module_name=$(basename "$module_file" .sh)
+            
+            local version_info=""
+            if [ -n "$MODULE_VERSION" ]; then
+                version_info=" ${WHITE}[v$MODULE_VERSION]${RESET}"
+            fi
+            
+            local author_info=""
+            if [ -n "$MODULE_AUTHOR" ]; then
+                author_info=" ${WHITE}($MODULE_AUTHOR)${RESET}"
+            fi
+            
+            echo -e "  ${GREEN}*${RESET} ${BOLD}${module_name}${RESET}${version_info} - ${MODULE_DESCRIPTION}${author_info}"
+        fi
+    done
+    
+    if [ "$found" = false ]; then
+        print_warning "No valid modules found"
+    fi
+}
+
+show_version() {
+    echo -e "${BOLD}Hectogon $VERSION${RESET}"
+    echo "Part of BaseUtils for OpenBase GNU/Linux"
+    echo "Developed by AnmiTaliDev"
+    echo "Released under GNU GPL 3.0"
+}
+
+show_help() {
+    print_header "Hectogon $VERSION"
+    echo "Usage: hectogon [module] [action] [options]"
+    echo ""
+    echo "General commands:"
+    echo "  list                     List all available modules"
+    echo "  help                     Show this help message"
+    echo "  version                  Show version information"
+    echo ""
+    echo "Module commands:"
+    echo "  <module> list            List available options for a module"
+    echo "  <module> show            Show current active option for a module"
+    echo "  <module> set <option>    Set the specified option for a module"
+    echo "  <module> add <path>      Add a new option to the module"
+    echo "  <module> remove <option> Remove an option from the module"
+    echo "  <module> help            Show help for a specific module"
+    echo ""
+    echo "Examples:"
+    echo "  hectogon list            Show all available modules"
+    echo "  hectogon editor list     List available editors"
+    echo "  hectogon editor set vim  Set vim as the default editor"
+    echo ""
+    echo "Configuration:"
+    echo "  Main configuration file: $CONFIG"
+    echo "  Modules directory: $MODULEDIR"
+    echo ""
+    echo "For more information, visit: https://github.com/AnmiTaliDev/hectogon"
+    echo "Released under GNU GPL 3.0"
+}
+
+exec_module_command() {
+    local module=$1
+    local action=$2
+    shift 2
+    
+    if ! load_module "$module"; then
+        return 1
+    fi
+    
+    case "$action" in
+        list)
+            print_header "$module alternatives:"
+            module_list "$@"
+            ;;
+        show)
+            print_header "Current $module setting:"
+            module_show "$@"
+            ;;
+        set)
+            if [ -z "$1" ]; then
+                print_error "Missing option argument for 'set' command"
+                echo "Usage: hectogon $module set <option>"
+                return 1
+            fi
+            
+            check_root "required"
+            
+            print_header "Setting $module to: $1"
+            module_set "$@"
+            ;;
+        add)
+            if [ -z "$1" ]; then
+                print_error "Missing path argument for 'add' command"
+                echo "Usage: hectogon $module add <path>"
+                return 1
+            fi
+            
+            check_root "required"
+            
+            print_header "Adding new $module option: $1"
+            if type -t module_add >/dev/null; then
+                module_add "$@"
+            else
+                print_error "The '$module' module does not support the 'add' action"
+                return 1
+            fi
+            ;;
+        remove)
+            if [ -z "$1" ]; then
+                print_error "Missing option argument for 'remove' command"
+                echo "Usage: hectogon $module remove <option>"
+                return 1
+            fi
+            
+            check_root "required"
+            
+            print_header "Removing $module option: $1"
+            if type -t module_remove >/dev/null; then
+                module_remove "$@"
+            else
+                print_error "The '$module' module does not support the 'remove' action"
+                return 1
+            fi
+            ;;
+        help)
+            print_header "$module module help:"
+            module_help "$@"
+            ;;
+        *)
+            print_error "Unknown action: $action"
+            echo "Available actions for module $module:"
+            echo "  list    - List available options"
+            echo "  show    - Show current active option"
+            echo "  set     - Set an option as active"
+            if type -t module_add >/dev/null; then
+                echo "  add     - Add a new option"
+            fi
+            if type -t module_remove >/dev/null; then
+                echo "  remove  - Remove an option"
+            fi
+            echo "  help    - Show module help"
+            return 1
+            ;;
+    esac
+    
+    return $?
+}
+
+die() {
+    print_error "$1"
+    echo "Run 'hectogon help' for usage information"
+    exit 1
+}
+
+main() {
+    load_config
+    
+    if [ $# -eq 0 ]; then
+        show_help
+        return 0
+    fi
+    
+    local command=$1
+    shift
+    
+    case "$command" in
+        list)
+            list_modules
+            ;;
+        help)
+            show_help
+            ;;
+        version)
+            show_version
+            ;;
+        --help|-h)
+            show_help
+            ;;
+        --version|-v)
+            show_version
+            ;;
+        *)
+            if [ $# -eq 0 ]; then
+                die "Missing action for module '$command'"
+            fi
+            
+            exec_module_command "$command" "$1" "${@:2}"
+            ;;
+    esac
+    
+    return $?
+}
+
+main "$@"
+exit $?
